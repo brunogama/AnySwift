@@ -1,0 +1,328 @@
+name: Mutation Testing
+
+on:
+  # Weekly scheduled run for full codebase analysis
+  schedule:
+    - cron: '0 3 * * 0'  # Sundays at 3:00 AM UTC
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Mutation testing scope'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full     # Full codebase mutation testing
+          - changed  # Only test files changed in latest commit
+
+permissions:
+  contents: read
+  issues: write
+  # Note: if GITHUB_TOKEN is blocked for scheduled issue creation in your org/repo,
+  # create a fine-scoped PAT and store it as CI_ISSUE_TOKEN, then replace
+  # `github-token: ${{ secrets.GITHUB_TOKEN }}` with
+  # `github-token: ${{ secrets.CI_ISSUE_TOKEN }}` in the issue step below.
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================
+  # Required Quality Gates - Block PR if failing
+  # ============================================
+
+  lint:
+    name: SwiftLint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install SwiftLint
+        run: brew install swiftlint
+      - name: Lint
+        run: swiftlint lint --strict
+
+  format-check:
+    name: swift-format
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install swift-format
+        run: brew install swift-format
+      - name: Check formatting
+        run: |
+          swift-format lint --configuration .swift-format --recursive \
+            ./Package.swift ./Sources ./Tests
+          if [ $? -ne 0 ]; then
+            echo "❌ Code is not formatted. Run 'make format' to fix."
+            exit 1
+          fi
+
+  test:
+    name: Tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Cache derived data
+        uses: actions/cache@v4
+        with:
+          path: ~/.derivedData
+          key: test-${{ hashFiles('**/Sources/**/*.swift', '**/Tests/**/*.swift') }}
+          restore-keys: test-
+      - name: Run tests
+        run: swift test
+
+  # ============================================
+  # Mutation Testing - Only runs after gates pass
+  # ============================================
+
+  mutation-testing:
+    needs: [lint, format-check, test]  # Block if any gate fails
+    name: Muter Mutation Testing
+    runs-on: macos-15
+    timeout-minutes: 120  # Mutation testing can be lengthy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff analysis
+
+      - name: Select Xcode 16.4
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+
+      - name: Install Muter
+        run: |
+          brew tap muter-mutation-testing/muter
+          brew install muter
+
+      - name: Get changed files
+        id: changed-files
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.scope == 'changed'
+        run: |
+          # Get Swift source files changed in the latest commit only.
+          # Note: for workflow_dispatch this compares HEAD~1..HEAD (single commit).
+          # To cover a broader range, trigger with scope=full instead.
+          CHANGED_FILES=$(git diff --name-only HEAD~1...HEAD | \
+            grep -E '^Sources/.*\.swift$' | \
+            tr '\n' ',' | sed 's/,$//')
+          echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "Changed source files: $CHANGED_FILES"
+
+      - name: Cache derived data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.derivedData
+            ~/Library/Caches/muter
+          key: muter-${{ hashFiles('**/Sources/**/*.swift', '**/Tests/**/*.swift') }}
+          restore-keys: |
+            muter-
+
+      - name: Create Muter configuration
+        run: |
+          cat > muter.conf.yml << 'EOF'
+          # Muter Configuration for InvariantSwift
+          # https://github.com/muter-mutation-testing/muter
+
+          # Command to build the project
+          buildCommand: swift build
+
+          # Command to run tests
+          testCommands:
+            - swift test --filter FunctionalTesting
+
+          # Files to exclude from mutation
+          excludeFileList:
+            # Exclude test files
+            - "Tests/**"
+            # Exclude example files
+            - "Examples/**"
+            # Exclude generated/disabled files
+            - "**/*.disabled"
+            # Exclude CLI (entry point, not core logic)
+            - "Sources/FuncTestCLI/**"
+            # Exclude plugins
+            - "Plugins/**"
+
+          # Exclude specific mutation operators if needed
+          # Uncomment to exclude specific operators:
+          # excludeMutationOperatorList:
+          #   - ChangeLogicalConnector
+          #   - RemoveSideEffects
+
+          # Only mutate specific files (for faster runs)
+          # Populated dynamically for PR runs
+          EOF
+
+      - name: Run Muter (Changed Files Only)
+        id: muter-changed
+        if: steps.changed-files.outputs.files != '' && github.event.inputs.scope == 'changed'
+        run: |
+          echo "Running mutation testing on changed files..."
+          echo "Files: ${{ steps.changed-files.outputs.files }}"
+
+          # Run muter on specific files
+          muter run --files-to-mutate "${{ steps.changed-files.outputs.files }}" \
+            --output-json muter-results.json \
+            --output-html muter-report.html \
+            2>&1 | tee muter-output.log
+
+          # Extract mutation score
+          if [ -f muter-results.json ]; then
+            SCORE=$(jq -r '.globalMutationScore // 0' muter-results.json)
+            echo "score=$SCORE" >> $GITHUB_OUTPUT
+            echo "Mutation Score: $SCORE%"
+          fi
+        continue-on-error: true
+
+      - name: Run Muter (Full Codebase)
+        id: muter-full
+        # Runs for: scheduled runs, explicit 'full' scope, or 'changed' scope with no
+        # matching Swift source files in HEAD~1..HEAD (fallback to full scan).
+        if: github.event_name == 'schedule' || github.event.inputs.scope == 'full' || (github.event.inputs.scope == 'changed' && steps.changed-files.outputs.files == '')
+        run: |
+          echo "Running full mutation testing..."
+
+          muter run \
+            --output-json muter-results.json \
+            --output-html muter-report.html \
+            2>&1 | tee muter-output.log
+
+          # Extract mutation score
+          if [ -f muter-results.json ]; then
+            SCORE=$(jq -r '.globalMutationScore // 0' muter-results.json)
+            echo "score=$SCORE" >> $GITHUB_OUTPUT
+            echo "Mutation Score: $SCORE%"
+          fi
+        continue-on-error: true
+
+      - name: Upload Mutation Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-report
+          path: |
+            muter-results.json
+            muter-report.html
+            muter-output.log
+          retention-days: 30
+
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request' && (steps.muter-changed.outputs.score || steps.muter-full.outputs.score)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let score = '${{ steps.muter-changed.outputs.score }}' || '${{ steps.muter-full.outputs.score }}';
+            let emoji = '🟢';
+            if (parseFloat(score) < 70) emoji = '🔴';
+            else if (parseFloat(score) < 85) emoji = '🟡';
+
+            let summary = '';
+            if (fs.existsSync('muter-results.json')) {
+              const results = JSON.parse(fs.readFileSync('muter-results.json', 'utf8'));
+              const totalMutants = results.totalMutantsCreated || 0;
+              const killedMutants = results.numberOfKilledMutants || 0;
+              const survivedMutants = totalMutants - killedMutants;
+
+              summary = `
+            | Metric | Value |
+            |--------|-------|
+            | Total Mutants | ${totalMutants} |
+            | Killed Mutants | ${killedMutants} |
+            | Survived Mutants | ${survivedMutants} |
+            `;
+            }
+
+            const body = `## ${emoji} Mutation Testing Results
+
+            **Mutation Score: ${score}%**
+
+            ${summary}
+
+            > A higher mutation score indicates better test quality. Aim for 80%+ on critical code paths.
+
+            <details>
+            <summary>What is mutation testing?</summary>
+
+            Mutation testing introduces small changes (mutants) to your code and checks if your tests catch them.
+            - **Killed mutant**: A test failed, meaning your tests detected the change ✅
+            - **Survived mutant**: All tests passed despite the change, indicating a potential testing gap ⚠️
+
+            </details>
+
+            📁 [Download full report](../actions/runs/${{ github.run_id }})
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Check Mutation Score Threshold
+        if: steps.muter-changed.outputs.score || steps.muter-full.outputs.score
+        run: |
+          SCORE=${{ steps.muter-changed.outputs.score || steps.muter-full.outputs.score }}
+          THRESHOLD=50  # Minimum acceptable mutation score
+
+          echo "Mutation Score: $SCORE%"
+          echo "Threshold: $THRESHOLD%"
+
+          if (( $(echo "$SCORE < $THRESHOLD" | bc -l) )); then
+            echo "❌ Mutation score ($SCORE%) is below threshold ($THRESHOLD%)"
+            echo "Consider improving test coverage for the affected code."
+            # Uncomment to enforce threshold:
+            # exit 1
+          else
+            echo "✅ Mutation score ($SCORE%) meets threshold ($THRESHOLD%)"
+          fi
+
+      - name: Create or Update Issue on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const title = "CI: Mutation Testing failing";
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = [
+              "Mutation Testing workflow failed.",
+              "",
+              `Run: ${runUrl}`,
+              `Ref: ${process.env.GITHUB_REF}`,
+              `SHA: ${process.env.GITHUB_SHA}`,
+              "",
+              "Artifacts (mutation-report) are available on the run page linked above."
+            ].join("\n");
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              per_page: 100
+            });
+
+            const existing = issues.find(i => i.title === title);
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ["ci", "mutation-testing"]
+              });
+            }
