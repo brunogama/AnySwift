@@ -1,3 +1,4 @@
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/brunogama/AnySwift?utm_source=oss&utm_medium=github&utm_campaign=brunogama%2FAnySwift&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
 # AnySwift
 
 Type-erased building blocks for Swift apps, workflows, and architecture layers.
